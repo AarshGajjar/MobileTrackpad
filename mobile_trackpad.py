@@ -6,6 +6,8 @@ import sys
 from aiohttp import web
 import logging
 from ctypes import windll
+from collections import deque
+import time
 
 # Disable unnecessary logging
 logging.getLogger('websockets').setLevel(logging.ERROR)
@@ -16,6 +18,52 @@ pyautogui.FAILSAFE = False
 pyautogui.MINIMUM_DURATION = 0
 pyautogui.MINIMUM_SLEEP = 0
 pyautogui.PAUSE = 0
+
+# Movement smoothing settings
+MOVEMENT_BUFFER_SIZE = 3  # Number of movements to average
+MOVEMENT_THRESHOLD = 0.1  # Minimum movement to register
+MAX_QUEUE_SIZE = 10  # Maximum number of events to queue
+
+class MovementBuffer:
+    def __init__(self, size=MOVEMENT_BUFFER_SIZE):
+        self.buffer_x = deque(maxlen=size)
+        self.buffer_y = deque(maxlen=size)
+        self.last_process_time = time.time()
+        self.accumulated_x = 0
+        self.accumulated_y = 0
+
+    def add_movement(self, x, y):
+        self.buffer_x.append(x)
+        self.buffer_y.append(y)
+        self.accumulated_x += x
+        self.accumulated_y += y
+
+    def get_smooth_movement(self):
+        if not self.buffer_x or not self.buffer_y:
+            return 0, 0
+
+        current_time = time.time()
+        time_delta = current_time - self.last_process_time
+
+        # Process accumulated movements if enough time has passed
+        if time_delta >= 0.016:  # ~60fps
+            x = self.accumulated_x
+            y = self.accumulated_y
+            
+            # Reset accumulators
+            self.accumulated_x = 0
+            self.accumulated_y = 0
+            self.last_process_time = current_time
+            
+            # Apply threshold to reduce jitter
+            if abs(x) < MOVEMENT_THRESHOLD:
+                x = 0
+            if abs(y) < MOVEMENT_THRESHOLD:
+                y = 0
+                
+            return x, y
+            
+        return 0, 0
 
 def get_local_ip():
     s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
@@ -90,7 +138,7 @@ MOBILE_HTML = '''
             position: relative;
         }
         #scrollbar {
-            width: 20px;
+            width: 40px;
             background: rgb(255, 255, 255);
             touch-action: none;
             position: relative;
@@ -108,7 +156,7 @@ MOBILE_HTML = '''
             transition: opacity 0.2s;
         }
         #scroll-indicator {
-            width: 20px;
+            width: 40px;
             height: 100px;
             right: 0;
             opacity: 0;
@@ -163,14 +211,17 @@ MOBILE_HTML = '''
         let zoomThreshold = 100; // Minimum pixels to trigger zoom
         let twoFingerStartY = null;
         let lastTwoFingerY = null;
+        let lastTwoFingerX = null;
         
         const twoFingerScrollSensitivity = 0.1;
-        const mouseSensitivity = 3.5;
-        const scrollSensitivity = 1.0;
+        const mouseSensitivity = 4;
+        const scrollSensitivity = 0.1;
+        const SEND_INTERVAL = 10; // ~100fps
+        let lastSendTime = 0;
         
         // Gesture settings
         const TAP_THRESHOLD = 150;
-        const MOVE_THRESHOLD = 3;
+        const MOVE_THRESHOLD = 1;
         const THREE_FINGER_SWIPE_THRESHOLD = 50;
         const ZOOM_COOLDOWN = 300; // Minimum ms between zoom events
 
@@ -203,7 +254,7 @@ MOBILE_HTML = '''
 
         function processEventQueue() {
             const now = performance.now();
-            if (eventQueue.length > 0 && now - lastEventTime >= 16) {
+            if (eventQueue.length > 0 && now - lastEventTime >= 1) {
                 const event = eventQueue.pop();
                 eventQueue = [];
                 if (ws?.readyState === WebSocket.OPEN && ws.bufferedAmount === 0) {
@@ -215,9 +266,12 @@ MOBILE_HTML = '''
         }
 
         function queueEvent(event) {
-            eventQueue.push(event);
-            if (!animationFrameId) {
-                animationFrameId = requestAnimationFrame(processEventQueue);
+            const now = performance.now();
+            if (now - lastSendTime >= SEND_INTERVAL) {
+                if (ws?.readyState === WebSocket.OPEN && ws.bufferedAmount === 0) {
+                    ws.send(JSON.stringify(event));
+                    lastSendTime = now;
+                }
             }
         }
 
@@ -227,7 +281,7 @@ MOBILE_HTML = '''
             feedback.style.left = x + 'px';
             feedback.style.top = y + 'px';
             document.body.appendChild(feedback);
-            setTimeout(() => feedback.remove(), 300);
+            setTimeout(() => feedback.remove(), 100);
         }
 
         function handleTrackpadTouch(e) {
@@ -256,13 +310,16 @@ MOBILE_HTML = '''
                 const touch1 = touches[0];
                 const touch2 = touches[1];
                 const currentY = (touch1.clientY + touch2.clientY) / 2;
+                const currentX = (touch1.clientX + touch2.clientX) / 2;
                 
-                if (lastTwoFingerY !== null) {
-                    const deltaY = (currentY - lastTwoFingerY) * twoFingerScrollSensitivity;
-                    queueEvent({type: 'scroll', x: 0, y: deltaY});
+                if (lastTwoFingerY !== null && lastTwoFingerX !== null) {
+                    const deltaY = -1 * (currentY - lastTwoFingerY) * twoFingerScrollSensitivity;
+                    const deltaX = (currentX - lastTwoFingerX) * twoFingerScrollSensitivity;
+                    queueEvent({type: 'scroll', x: deltaX, y: deltaY});
                 }
                 
                 lastTwoFingerY = currentY;
+                lastTwoFingerX = currentX;
                 
                 // Create touch feedback for both fingers
                 createTouchFeedback(touch1.clientX, touch1.clientY);
@@ -331,14 +388,14 @@ MOBILE_HTML = '''
 
         // Trackpad events
         trackpad.addEventListener('touchstart', (e) => {
-    e.preventDefault();
-    touchStartTime = Date.now();
-    isTapping = true;
-    initialTouchPos = {
-        x: e.touches[0].clientX,
-        y: e.touches[0].clientY
-    };
-});
+            e.preventDefault();
+            touchStartTime = Date.now();
+            isTapping = true;
+            initialTouchPos = {
+                x: e.touches[0].clientX,
+                y: e.touches[0].clientY
+            };
+        });
 
         trackpad.addEventListener('touchmove', (e) => {
             e.preventDefault();
@@ -353,6 +410,8 @@ MOBILE_HTML = '''
                 }
                 threeFingerStartX = null;
                 lastTouches = {};
+                lastTwoFingerY = null;
+                lastTwoFingerX = null;
             }
             initialTouchPos = null;
         });
@@ -405,31 +464,67 @@ MOBILE_HTML = '''
 '''
 
 async def websocket_handler(request):
-    ws = web.WebSocketResponse(timeout=1)
+    ws = web.WebSocketResponse(timeout=1, heartbeat=0.5)  # Add heartbeat to keep connection alive
     await ws.prepare(request)
+    
+    movement_buffer = MovementBuffer()
+    last_process_time = time.time()
+    event_queue = deque(maxlen=MAX_QUEUE_SIZE)
 
-    async for msg in ws:
-        if msg.type == web.WSMsgType.TEXT:
-            data = json.loads(msg.data)
-            
-            if data['type'] == 'move':
-                pyautogui.moveRel(data['x'], data['y'], duration=0)
-            
-            elif data['type'] == 'click':
-                pyautogui.click(button=data['button'])
-            
-            elif data['type'] == 'scroll':
-                scroll_amount = int(data['y'] * -60)
-                windll.user32.mouse_event(0x0800, 0, 0, scroll_amount, 0)
-            
-            elif data['type'] == 'zoom':
-                if data['scale'] > 1:
-                    pyautogui.hotkey('ctrl', '+')
-                else:
-                    pyautogui.hotkey('ctrl', '-')
-            
-            elif data['type'] == 'nextWindow':
-                pyautogui.hotkey('alt', 'tab')
+    async def process_events():
+        while True:
+            try:
+                if event_queue:
+                    event = event_queue.popleft()
+                    
+                    if event['type'] == 'move':
+                        movement_buffer.add_movement(event['x'], event['y'])
+                        x, y = movement_buffer.get_smooth_movement()
+                        if x != 0 or y != 0:
+                            pyautogui.moveRel(x, y, duration=0)
+                    
+                    elif event['type'] == 'scroll':
+                        scroll_y = int(event['y'] * -60)
+                        scroll_x = int(event['x'] * -60)
+                        if scroll_y != 0:
+                            windll.user32.mouse_event(0x0800, 0, 0, scroll_y, 0)
+                        if scroll_x != 0:
+                            windll.user32.mouse_event(0x01000, 0, 0, scroll_x, 0)
+                    
+                    elif event['type'] == 'click':
+                        pyautogui.click(button=event['button'])
+                    
+                    elif event['type'] == 'zoom':
+                        if event['scale'] > 1:
+                            pyautogui.hotkey('ctrl', '+')
+                        else:
+                            pyautogui.hotkey('ctrl', '-')
+                    
+                    elif event['type'] == 'nextWindow':
+                        pyautogui.hotkey('alt', 'tab')
+                
+                await asyncio.sleep(0.016)  # Cap at ~60fps
+            except Exception as e:
+                logging.error(f"Error processing events: {e}")
+                await asyncio.sleep(0.1)
+
+    # Start the event processing task
+    process_task = asyncio.create_task(process_events())
+
+    try:
+        async for msg in ws:
+            if msg.type == web.WSMsgType.TEXT:
+                try:
+                    data = json.loads(msg.data)
+                    event_queue.append(data)
+                except json.JSONDecodeError:
+                    continue
+    finally:
+        process_task.cancel()
+        try:
+            await process_task
+        except asyncio.CancelledError:
+            pass
 
     return ws
 
@@ -447,13 +542,17 @@ async def main():
     
     ip_address = get_local_ip()
     print(f"\nMobile Trackpad Server")
-
     print(f"====================")
     print(f"Connect to: http://{ip_address}:5000")
     print(f"Press Ctrl+C to stop the server\n")
     
-    await site.start()
-    await asyncio.Event().wait()
+    try:
+        await site.start()
+        await asyncio.Event().wait()  # Keeps the server running
+    finally:
+        print("Shutting down server...")
+        await runner.cleanup()
+
 
 if __name__ == '__main__':
     try:
