@@ -24,6 +24,20 @@ MOVEMENT_BUFFER_SIZE = 3  # Number of movements to average
 MOVEMENT_THRESHOLD = 0.1  # Minimum movement to register
 MAX_QUEUE_SIZE = 10  # Maximum number of events to queue
 
+MOUSE_SENSITIVITY = 3.5
+SCROLL_SENSITIVITY = 10
+
+def update_sensitivities(mouse_sens, scroll_sens):
+    """Update the sensitivity values and regenerate the HTML with new values"""
+    global MOUSE_SENSITIVITY, SCROLL_SENSITIVITY
+    MOUSE_SENSITIVITY = mouse_sens
+    SCROLL_SENSITIVITY = scroll_sens
+    return MOBILE_HTML.replace(
+        '${MOUSE_SENSITIVITY}', str(MOUSE_SENSITIVITY)
+    ).replace(
+        '${SCROLL_SENSITIVITY}', str(SCROLL_SENSITIVITY)
+    )
+
 class MovementBuffer:
     def __init__(self, size=MOVEMENT_BUFFER_SIZE):
         self.buffer_x = deque(maxlen=size)
@@ -212,10 +226,11 @@ MOBILE_HTML = '''
         let twoFingerStartY = null;
         let lastTwoFingerY = null;
         let lastTwoFingerX = null;
+        let threeFingerStartY = null;
         
         const twoFingerScrollSensitivity = 0.1;
-        const mouseSensitivity = 4;
-        const scrollSensitivity = 0.1;
+        const mouseSensitivity = ${MOUSE_SENSITIVITY};
+        const scrollSensitivity = ${SCROLL_SENSITIVITY};
         const SEND_INTERVAL = 10; // ~100fps
         let lastSendTime = 0;
         
@@ -223,6 +238,7 @@ MOBILE_HTML = '''
         const TAP_THRESHOLD = 150;
         const MOVE_THRESHOLD = 1;
         const THREE_FINGER_SWIPE_THRESHOLD = 50;
+        const THREE_FINGER_VERTICAL_THRESHOLD = 50; // Minimum pixels for vertical three-finger gesture
         const ZOOM_COOLDOWN = 300; // Minimum ms between zoom events
 
         // Fullscreen handling
@@ -326,15 +342,36 @@ MOBILE_HTML = '''
                 createTouchFeedback(touch2.clientX, touch2.clientY);
             }
             else if (numTouches === 3) {
+                const touches = Array.from(e.touches);
                 if (!threeFingerStartX) {
                     threeFingerStartX = (touches[0].clientX + touches[1].clientX + touches[2].clientX) / 3;
+                    threeFingerStartY = (touches[0].clientY + touches[1].clientY + touches[2].clientY) / 3;
                 } else {
                     const currentX = (touches[0].clientX + touches[1].clientX + touches[2].clientX) / 3;
-                    const swipeDistance = currentX - threeFingerStartX;
-
-                    if (Math.abs(swipeDistance) > THREE_FINGER_SWIPE_THRESHOLD) {
-                        queueEvent({type: 'nextWindow'});
-                        threeFingerStartX = currentX;
+                    const currentY = (touches[0].clientY + touches[1].clientY + touches[2].clientY) / 3;
+                    
+                    // Calculate horizontal and vertical movement
+                    const swipeDistanceX = currentX - threeFingerStartX;
+                    const swipeDistanceY = currentY - threeFingerStartY;
+                    
+                    // Check which direction had more movement
+                    if (Math.abs(swipeDistanceX) > Math.abs(swipeDistanceY)) {
+                        // Horizontal swipe
+                        if (Math.abs(swipeDistanceX) > THREE_FINGER_SWIPE_THRESHOLD) {
+                            queueEvent({type: 'nextWindow'});
+                            threeFingerStartX = currentX;
+                            threeFingerStartY = currentY;
+                        }
+                    } else {
+                        // Vertical swipe
+                        if (Math.abs(swipeDistanceY) > THREE_FINGER_VERTICAL_THRESHOLD) {
+                            queueEvent({
+                                type: 'verticalGesture',
+                                direction: swipeDistanceY > 0 ? 'down' : 'up'
+                            });
+                            threeFingerStartX = currentX;
+                            threeFingerStartY = currentY;
+                        }
                     }
                 }
             }
@@ -346,7 +383,7 @@ MOBILE_HTML = '''
             const prevTouch = lastTouches[touchId];
             
             if (prevTouch) {
-                const deltaY = (touch.clientY - prevTouch.clientY) * scrollSensitivity;
+                const deltaY = 10 * (touch.clientY - prevTouch.clientY) * scrollSensitivity;
                 queueEvent({type: 'scroll', x: 0, y: deltaY});
             }
             lastTouches[touchId] = { clientX: touch.clientX, clientY: touch.clientY };
@@ -409,6 +446,7 @@ MOBILE_HTML = '''
                     queueEvent({type: 'click', button: 'left'});
                 }
                 threeFingerStartX = null;
+                threeFingerStartY = null;
                 lastTouches = {};
                 lastTwoFingerY = null;
                 lastTwoFingerX = null;
@@ -468,8 +506,8 @@ async def websocket_handler(request):
     await ws.prepare(request)
     
     movement_buffer = MovementBuffer()
-    last_process_time = time.time()
     event_queue = deque(maxlen=MAX_QUEUE_SIZE)
+    process_task = None
 
     async def process_events():
         while True:
@@ -502,16 +540,25 @@ async def websocket_handler(request):
                     
                     elif event['type'] == 'nextWindow':
                         pyautogui.hotkey('alt', 'tab')
+
+                    elif data['type'] == 'verticalGesture':
+                        if data['direction'] == 'down':
+                            pyautogui.hotkey('win', 'm')  # Windows+M minimizes all windows
+                        else:  # direction is 'up'
+                            pyautogui.hotkey('win', 'shift', 'm')  # Windows+Shift+M restores all windows
                 
                 await asyncio.sleep(0.016)  # Cap at ~60fps
+            except asyncio.CancelledError:
+                break
             except Exception as e:
                 logging.error(f"Error processing events: {e}")
                 await asyncio.sleep(0.1)
 
-    # Start the event processing task
-    process_task = asyncio.create_task(process_events())
-
+    
     try:
+        # Start the event processing task
+        process_task = asyncio.create_task(process_events())
+
         async for msg in ws:
             if msg.type == web.WSMsgType.TEXT:
                 try:
@@ -529,7 +576,12 @@ async def websocket_handler(request):
     return ws
 
 async def index_handler(request):
-    return web.Response(text=MOBILE_HTML, content_type='text/html')
+    html = MOBILE_HTML.replace(
+        '${MOUSE_SENSITIVITY}', str(MOUSE_SENSITIVITY)
+    ).replace(
+        '${SCROLL_SENSITIVITY}', str(SCROLL_SENSITIVITY)
+    )
+    return web.Response(text=html, content_type='text/html')
 
 async def main():
     app = web.Application()
